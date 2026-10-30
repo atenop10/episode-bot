@@ -1,5 +1,6 @@
 import os
 import re
+import time
 import asyncio
 import sqlite3
 import logging
@@ -12,7 +13,7 @@ from telegram import (
 from telegram.error import BadRequest, Forbidden, RetryAfter
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, TypeHandler, filters,
+    ApplicationHandlerStop, ContextTypes, TypeHandler, filters,
 )
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -68,6 +69,23 @@ def init_db():
             username TEXT,
             joined TEXT DEFAULT CURRENT_TIMESTAMP,
             active INTEGER NOT NULL DEFAULT 1
+        );
+        CREATE TABLE IF NOT EXISTS settings(
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS deletions(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL,
+            message_id INTEGER NOT NULL,
+            delete_at REAL NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_deletions_at ON deletions(delete_at);
+        CREATE TABLE IF NOT EXISTS authorized(
+            user_id INTEGER PRIMARY KEY,
+            name TEXT,
+            added TEXT DEFAULT CURRENT_TIMESTAMP,
+            expires_at REAL
         );
     """)
     try:
@@ -142,14 +160,91 @@ async def do_search(update: Update, query: str):
     await update.message.reply_text("Pick a series:", reply_markup=InlineKeyboardMarkup(buttons))
 
 
-async def send_episode(bot, chat_id, name, row):
+def get_setting(key, default):
+    c = db()
+    r = c.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    c.close()
+    return r["value"] if r else default
+
+
+def set_setting(key, value):
+    c = db()
+    c.execute("INSERT OR REPLACE INTO settings(key, value) VALUES(?,?)", (key, str(value)))
+    c.commit()
+    c.close()
+
+
+def protect_on() -> bool:
+    return get_setting("protect", "1") == "1"      # default: ON
+
+
+def autodelete_minutes() -> int:
+    try:
+        return max(0, int(get_setting("autodelete", "0")))   # default: OFF
+    except ValueError:
+        return 0
+
+
+def fmt_minutes(m: int) -> str:
+    if m % 60 == 0:
+        h = m // 60
+        return f"{h} hour" + ("s" if h != 1 else "")
+    return f"{m} minute" + ("s" if m != 1 else "")
+
+
+def schedule_deletions(chat_id, message_ids, minutes):
+    if not message_ids or minutes <= 0:
+        return
+    t = time.time() + minutes * 60
+    c = db()
+    c.executemany(
+        "INSERT INTO deletions(chat_id, message_id, delete_at) VALUES(?,?,?)",
+        [(chat_id, i, t) for i in message_ids],
+    )
+    c.commit()
+    c.close()
+
+
+async def cleanup_loop(app: Application):
+    """Every 30 seconds, delete the messages whose time is up (survives bot restarts)."""
+    while True:
+        try:
+            await asyncio.sleep(30)
+            c = db()
+            rows = c.execute(
+                "SELECT id, chat_id, message_id FROM deletions WHERE delete_at <= ? ORDER BY id LIMIT 300",
+                (time.time(),),
+            ).fetchall()
+            c.close()
+            done = []
+            for r in rows:
+                try:
+                    await app.bot.delete_message(r["chat_id"], r["message_id"])
+                except RetryAfter as e:
+                    await asyncio.sleep(e.retry_after + 1)
+                    break                      # try the rest on the next round
+                except Exception:
+                    pass                       # already deleted, too old, or chat blocked
+                done.append((r["id"],))
+                await asyncio.sleep(0.05)
+            if done:
+                c = db()
+                c.executemany("DELETE FROM deletions WHERE id=?", done)
+                c.commit()
+                c.close()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logging.exception("cleanup loop error")
+
+
+async def send_episode(bot, chat_id, name, row, protect=False):
     cap = f"{name} - Episode {row['number']}"
     if row["kind"] == "audio":
-        await bot.send_audio(chat_id, row["file_id"], caption=cap)
-    elif row["kind"] == "voice":
-        await bot.send_voice(chat_id, row["file_id"], caption=cap)
-    else:
-        await bot.send_document(chat_id, row["file_id"], caption=cap)
+        return await bot.send_audio(chat_id, row["file_id"], caption=cap, protect_content=protect)
+    if row["kind"] == "voice":
+        return await bot.send_voice(chat_id, row["file_id"], caption=cap, protect_content=protect)
+    return await bot.send_document(chat_id, row["file_id"], caption=cap, protect_content=protect)
 
 
 async def with_retry(fn):
@@ -173,26 +268,29 @@ def make_chunks(rows):
     return out
 
 
-async def send_chunk(bot, chat_id, name, chunk):
-    """Send up to 10 episodes as one album. Falls back to one-by-one. Returns failed numbers."""
-    failed = []
+async def send_chunk(bot, chat_id, name, chunk, protect=False):
+    """Send up to 10 episodes as one album. Falls back to one-by-one.
+    Returns (failed episode numbers, sent message ids)."""
+    failed, sent = [], []
     kind = chunk[0]["kind"]
     if len(chunk) > 1 and kind in ("audio", "document"):
         cls = InputMediaAudio if kind == "audio" else InputMediaDocument
         media = [cls(media=r["file_id"], caption=f"{name} - Episode {r['number']}") for r in chunk]
         try:
-            await with_retry(lambda: bot.send_media_group(chat_id, media))
-            return failed
+            msgs = await with_retry(lambda: bot.send_media_group(chat_id, media, protect_content=protect))
+            sent.extend(m.message_id for m in msgs)
+            return failed, sent
         except Exception:
             logging.exception("album failed, sending one by one")
     for r in chunk:
         try:
-            await with_retry(lambda r=r: send_episode(bot, chat_id, name, r))
+            m = await with_retry(lambda r=r: send_episode(bot, chat_id, name, r, protect))
+            sent.append(m.message_id)
         except Exception:
             logging.exception("send failed for episode %s", r["number"])
             failed.append(r["number"])
         await asyncio.sleep(SEND_DELAY)
-    return failed
+    return failed, sent
 
 
 async def send_range(update: Update, ctx: ContextTypes.DEFAULT_TYPE, sid, a, b):
@@ -227,9 +325,25 @@ async def send_range(update: Update, ctx: ContextTypes.DEFAULT_TYPE, sid, a, b):
     have = {r["number"] for r in rows}
     missing = [n for n in range(a, b + 1) if n not in have]
 
+    protect = protect_on()
+    mins = autodelete_minutes()
     for chunk in make_chunks(rows):
-        missing += await send_chunk(ctx.bot, msg.chat_id, s["name"], chunk)
+        failed, ids = await send_chunk(ctx.bot, msg.chat_id, s["name"], chunk, protect)
+        missing += failed
+        schedule_deletions(msg.chat_id, ids, mins)
         await asyncio.sleep(SEND_DELAY)
+
+    if mins:
+        try:
+            note = await ctx.bot.send_message(
+                msg.chat_id,
+                f"⏳ For privacy, these episodes will be deleted from this chat in {fmt_minutes(mins)}. "
+                "Listen now!",
+                protect_content=protect,
+            )
+            schedule_deletions(msg.chat_id, [note.message_id], mins)
+        except Exception:
+            logging.warning("could not send the auto-delete notice")
 
     c = db()
     c.execute("UPDATE series SET hits = hits + 1 WHERE id=?", (sid,))
@@ -271,6 +385,14 @@ ADMIN_COMMANDS = USER_COMMANDS + [
     BotCommand("series", "List all series"),
     BotCommand("info", "Episodes available and missing"),
     BotCommand("stats", "Users, series, episodes, top series"),
+    BotCommand("allow", "Give a user access"),
+    BotCommand("revoke", "Remove a user's access"),
+    BotCommand("authorized", "List users with access"),
+    BotCommand("private", "Only authorized users on/off"),
+    BotCommand("allowall", "Authorize everyone who used the bot"),
+    BotCommand("privacy", "Privacy settings"),
+    BotCommand("protect", "Block forwarding and saving"),
+    BotCommand("autodelete", "Auto-delete sent episodes"),
     BotCommand("broadcast", "Send a message to all users"),
     BotCommand("rename", "Rename a series"),
     BotCommand("delep", "Delete episode(s)"),
@@ -301,6 +423,19 @@ Then send the audio files named like "Ep - 01" (the number is read from the name
 /delep Series Name | 5 - delete one episode
 /delep Series Name | 5-10 - delete a range
 /delseries Series Name - delete a series
+
+🔑 Access (private bot)
+/allow 123456789 - give a user access (the ID is in their access request)
+/allow 123456789 30 - access for 30 days only
+/revoke 123456789 - remove access
+/authorized - list users who have access
+/private on|off - only authorized users can use the bot
+/allowall - authorize everyone who already used the bot
+
+🔒 Privacy
+/privacy - show the privacy settings
+/protect on|off - block forwarding and saving of episodes
+/autodelete 60 - delete sent episodes after 60 minutes (/autodelete off to disable)
 
 📊 Users
 /stats - users, series, episodes, most requested
@@ -335,6 +470,7 @@ async def track_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "ON CONFLICT(user_id) DO UPDATE SET name=excluded.name, username=excluded.username, active=1",
         (u.id, u.full_name, u.username),
     )
+    c.execute("UPDATE authorized SET name=? WHERE user_id=?", (u.full_name, u.id))
     c.commit()
     c.close()
 
@@ -381,6 +517,10 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await q.answer()
     parts = q.data.split(":")
     uid = q.from_user.id
+
+    if parts[0] in ("ap", "rj"):
+        await handle_access_button(q, ctx, parts, uid)
+        return
 
     if parts[0] == "s":
         sid = int(parts[1])
@@ -694,6 +834,9 @@ async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     u = c.execute("SELECT COUNT(*) AS n, COALESCE(SUM(active), 0) AS a FROM users").fetchone()
     n_series = c.execute("SELECT COUNT(*) AS n FROM series").fetchone()["n"]
     n_eps = c.execute("SELECT COUNT(*) AS n FROM episodes").fetchone()["n"]
+    n_auth = c.execute(
+        "SELECT COUNT(*) AS n FROM authorized WHERE expires_at IS NULL OR expires_at > ?", (time.time(),)
+    ).fetchone()["n"]
     top = c.execute(
         "SELECT name, hits FROM series WHERE hits > 0 ORDER BY hits DESC LIMIT 5"
     ).fetchall()
@@ -701,6 +844,7 @@ async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = (
         "📊 Stats\n"
         f"👥 Users: {u['n']} ({u['a']} active)\n"
+        f"🔑 Authorized: {n_auth}\n"
         f"📚 Series: {n_series}\n"
         f"🎧 Episodes: {n_eps}"
     )
@@ -724,6 +868,7 @@ async def broadcast_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     c = db()
     ids = [r["user_id"] for r in c.execute("SELECT user_id FROM users WHERE active=1").fetchall()]
     c.close()
+    ids = [i for i in ids if auth_status(i) == "ok"]
     if not ids:
         await update.message.reply_text("No users yet.")
         return
@@ -753,7 +898,257 @@ async def broadcast_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.application.create_task(job(), update=update)
 
 
+def private_on() -> bool:
+    return get_setting("private", "1") == "1"      # default: ON (only authorized users)
+
+
+def auth_status(uid) -> str:
+    """Returns 'ok', 'expired' or 'no'."""
+    if uid in ADMINS or not private_on():
+        return "ok"
+    c = db()
+    r = c.execute("SELECT expires_at FROM authorized WHERE user_id=?", (uid,)).fetchone()
+    c.close()
+    if not r:
+        return "no"
+    if r["expires_at"] is None or r["expires_at"] > time.time():
+        return "ok"
+    return "expired"
+
+
+async def request_access(u, ctx: ContextTypes.DEFAULT_TYPE):
+    pending = ctx.application.bot_data.setdefault("requested", set())
+    if u.id in pending:
+        return
+    pending.add(u.id)
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"ap:{u.id}"),
+        InlineKeyboardButton("❌ Reject", callback_data=f"rj:{u.id}"),
+    ]])
+    text = (
+        "🔑 Access request\n"
+        f"Name: {u.full_name}\n"
+        f"Username: @{u.username or '-'}\n"
+        f"ID: {u.id}\n\n"
+        "Approve gives access with no expiry. For a limited time use /allow ID DAYS."
+    )
+    for aid in ADMINS:
+        try:
+            await ctx.bot.send_message(aid, text, reply_markup=kb)
+        except Exception:
+            logging.warning("could not send access request to admin %s", aid)
+
+
+async def gate(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Runs before everything else. Blocks anyone who is not authorized."""
+    u = update.effective_user
+    chat = update.effective_chat
+    if not u or u.is_bot or not chat or chat.type != "private":
+        raise ApplicationHandlerStop          # the bot only works in private chats
+    status = auth_status(u.id)
+    if status == "ok":
+        return
+
+    q = update.callback_query
+    if q and q.data == "req":
+        await q.answer()
+        await request_access(u, ctx)
+        try:
+            await q.edit_message_text("✅ Request sent to the admin. You will get a message when you are approved.")
+        except Exception:
+            pass
+        raise ApplicationHandlerStop
+    if q:
+        await q.answer("🔒 Not authorized", show_alert=True)
+        raise ApplicationHandlerStop
+
+    msg = update.effective_message
+    if msg:
+        last = ctx.application.bot_data.setdefault("notice_at", {})
+        now = time.time()
+        if now - last.get(u.id, 0) > 30:          # do not answer the same person more than every 30 s
+            last[u.id] = now
+            head = "⏳ Your access has expired." if status == "expired" else "🔒 This bot is private."
+            await msg.reply_text(
+                f"{head}\nYour ID: {u.id}\n\nTap below to ask the admin for access.",
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton("🔑 Request access", callback_data="req")]]
+                ),
+            )
+    raise ApplicationHandlerStop
+
+
+async def handle_access_button(q, ctx: ContextTypes.DEFAULT_TYPE, parts, uid):
+    if not is_admin_id(uid):
+        return
+    target = int(parts[1])
+    if parts[0] == "ap":
+        name = ""
+        try:
+            name = (await ctx.bot.get_chat(target)).full_name or ""
+        except Exception:
+            pass
+        c = db()
+        c.execute(
+            "INSERT OR REPLACE INTO authorized(user_id, name, expires_at) VALUES(?,?,NULL)", (target, name)
+        )
+        c.commit()
+        c.close()
+        ctx.application.bot_data.setdefault("requested", set()).discard(target)
+        result = f"✅ Approved: {name or target}"
+        try:
+            await ctx.bot.send_message(target, "✅ You now have access. Type /start to begin.")
+        except Exception:
+            pass
+    else:
+        result = f"❌ Rejected: {target}"
+        try:
+            await ctx.bot.send_message(target, "Your access request was declined.")
+        except Exception:
+            pass
+    try:
+        await q.edit_message_text(result)
+    except BadRequest:
+        pass
+
+
+async def allow_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    usage = "Usage: /allow 123456789   or   /allow 123456789 30   (30 = days)"
+    if not ctx.args or not ctx.args[0].isdigit():
+        await update.message.reply_text(usage)
+        return
+    uid = int(ctx.args[0])
+    days = None
+    if len(ctx.args) > 1:
+        if not ctx.args[1].isdigit() or not 1 <= int(ctx.args[1]) <= 3650:
+            await update.message.reply_text(usage)
+            return
+        days = int(ctx.args[1])
+    expires = time.time() + days * 86400 if days else None
+    name = ""
+    try:
+        name = (await ctx.bot.get_chat(uid)).full_name or ""
+    except Exception:
+        pass
+    c = db()
+    c.execute(
+        "INSERT OR REPLACE INTO authorized(user_id, name, expires_at) VALUES(?,?,?)", (uid, name, expires)
+    )
+    c.commit()
+    c.close()
+    ctx.application.bot_data.setdefault("requested", set()).discard(uid)
+    until = f"for {days} day(s)" if days else "with no expiry"
+    await update.message.reply_text(f"✅ Access granted to {name or uid} ({uid}) {until}.")
+    try:
+        await ctx.bot.send_message(uid, "✅ You now have access. Type /start to begin.")
+    except Exception:
+        await update.message.reply_text("(Could not message them. They need to open the bot and press Start.)")
+
+
+async def revoke_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    if not ctx.args or not ctx.args[0].isdigit():
+        await update.message.reply_text("Usage: /revoke 123456789")
+        return
+    uid = int(ctx.args[0])
+    c = db()
+    cur = c.execute("DELETE FROM authorized WHERE user_id=?", (uid,))
+    c.commit()
+    c.close()
+    await update.message.reply_text("🚫 Access removed." if cur.rowcount else "That user was not in the list.")
+
+
+async def authorized_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    c = db()
+    rows = c.execute("SELECT user_id, name, expires_at FROM authorized ORDER BY added DESC").fetchall()
+    c.close()
+    if not rows:
+        await update.message.reply_text("No authorized users yet. Use /allow ID or wait for access requests.")
+        return
+    now = time.time()
+    lines = []
+    for r in rows:
+        if r["expires_at"] is None:
+            exp = "no expiry"
+        else:
+            exp = "expires " + time.strftime("%Y-%m-%d", time.localtime(r["expires_at"]))
+            if r["expires_at"] <= now:
+                exp += " (EXPIRED)"
+        lines.append(f"{r['user_id']} - {r['name'] or '?'} - {exp}")
+    text = f"🔑 Authorized users: {len(rows)}\n\n" + "\n".join(lines)
+    for i in range(0, len(text), 4000):
+        await update.message.reply_text(text[i:i + 4000])
+
+
+async def private_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    arg = ctx.args[0].lower() if ctx.args else ""
+    if arg in ("on", "off"):
+        set_setting("private", "1" if arg == "on" else "0")
+    state = "ON (only authorized users can use the bot)" if private_on() else "OFF (everyone can use the bot)"
+    await update.message.reply_text(f"🔑 Private mode: {state}\n\nChange with /private on or /private off")
+
+
+async def allowall_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    c = db()
+    cur = c.execute("INSERT OR IGNORE INTO authorized(user_id, name) SELECT user_id, name FROM users")
+    c.commit()
+    c.close()
+    await update.message.reply_text(f"✅ Authorized {cur.rowcount} existing user(s), with no expiry.")
+
+
+def privacy_text():
+    mins = autodelete_minutes()
+    return (
+        "🔒 Privacy settings\n"
+        f"• Content protection (no forwarding/saving): {'ON' if protect_on() else 'OFF'}\n"
+        f"• Auto-delete sent episodes: {('after ' + fmt_minutes(mins)) if mins else 'OFF'}\n\n"
+        "Change with:\n/protect on|off\n/autodelete 60   (minutes, max 1440)\n/autodelete off"
+    )
+
+
+async def privacy_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if is_admin(update):
+        await update.message.reply_text(privacy_text())
+
+
+async def protect_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    arg = ctx.args[0].lower() if ctx.args else ""
+    if arg not in ("on", "off"):
+        await update.message.reply_text("Usage: /protect on   or   /protect off\n\n" + privacy_text())
+        return
+    set_setting("protect", "1" if arg == "on" else "0")
+    await update.message.reply_text(privacy_text())
+
+
+async def autodelete_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    arg = ctx.args[0].lower() if ctx.args else ""
+    if arg in ("off", "0"):
+        set_setting("autodelete", "0")
+    elif arg.isdigit() and 1 <= int(arg) <= 1440:
+        set_setting("autodelete", int(arg))
+    else:
+        await update.message.reply_text(
+            "Usage: /autodelete 60   (1 to 1440 minutes)\n       /autodelete off\n\n" + privacy_text()
+        )
+        return
+    await update.message.reply_text(privacy_text())
+
+
 async def post_init(app: Application):
+    app.bot_data["cleaner"] = asyncio.create_task(cleanup_loop(app))
     try:
         await app.bot.set_my_commands(USER_COMMANDS)
     except Exception:
@@ -774,6 +1169,7 @@ def main():
     init_db()
 
     app = Application.builder().token(token).post_init(post_init).build()
+    app.add_handler(TypeHandler(Update, gate), group=-2)
     app.add_handler(TypeHandler(Update, track_user), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
@@ -790,6 +1186,14 @@ def main():
     app.add_handler(CommandHandler("info", info_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("broadcast", broadcast_cmd))
+    app.add_handler(CommandHandler("allow", allow_cmd))
+    app.add_handler(CommandHandler("revoke", revoke_cmd))
+    app.add_handler(CommandHandler("authorized", authorized_cmd))
+    app.add_handler(CommandHandler("private", private_cmd))
+    app.add_handler(CommandHandler("allowall", allowall_cmd))
+    app.add_handler(CommandHandler("privacy", privacy_cmd))
+    app.add_handler(CommandHandler("protect", protect_cmd))
+    app.add_handler(CommandHandler("autodelete", autodelete_cmd))
     app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE | filters.Document.ALL, on_upload))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
