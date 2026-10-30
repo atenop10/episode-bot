@@ -6,13 +6,13 @@ import logging
 
 from dotenv import load_dotenv
 from telegram import (
-    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    BotCommand, BotCommandScopeChat, Update, InlineKeyboardButton, InlineKeyboardMarkup,
     InputMediaAudio, InputMediaDocument,
 )
-from telegram.error import BadRequest, RetryAfter
+from telegram.error import BadRequest, Forbidden, RetryAfter
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
-    ContextTypes, filters,
+    ContextTypes, TypeHandler, filters,
 )
 
 BASE = os.path.dirname(os.path.abspath(__file__))
@@ -62,7 +62,18 @@ def init_db():
             series_id INTEGER NOT NULL,
             next_number INTEGER NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS users(
+            user_id INTEGER PRIMARY KEY,
+            name TEXT,
+            username TEXT,
+            joined TEXT DEFAULT CURRENT_TIMESTAMP,
+            active INTEGER NOT NULL DEFAULT 1
+        );
     """)
+    try:
+        c.execute("ALTER TABLE series ADD COLUMN hits INTEGER NOT NULL DEFAULT 0")
+    except sqlite3.OperationalError:
+        pass  # column already exists
     c.commit()
     c.close()
 
@@ -220,6 +231,11 @@ async def send_range(update: Update, ctx: ContextTypes.DEFAULT_TYPE, sid, a, b):
         missing += await send_chunk(ctx.bot, msg.chat_id, s["name"], chunk)
         await asyncio.sleep(SEND_DELAY)
 
+    c = db()
+    c.execute("UPDATE series SET hits = hits + 1 WHERE id=?", (sid,))
+    c.commit()
+    c.close()
+
     if missing:
         missing = sorted(set(missing))
         shown = ", ".join(str(n) for n in missing[:30])
@@ -228,34 +244,99 @@ async def send_range(update: Update, ctx: ContextTypes.DEFAULT_TYPE, sid, a, b):
 
 
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if is_admin(update):
+        try:
+            await ctx.bot.set_my_commands(
+                ADMIN_COMMANDS, scope=BotCommandScopeChat(update.effective_chat.id)
+            )
+        except Exception:
+            logging.warning("could not set admin command menu")
     await update.message.reply_text(
         "👋 Welcome!\nType a series name to find it.\n"
         "Then send an episode number (350) or a range (350-370).\n\n/help for more."
     )
 
 
+USER_COMMANDS = [
+    BotCommand("start", "Start the bot"),
+    BotCommand("help", "How to use the bot"),
+    BotCommand("search", "Search a series"),
+]
+ADMIN_COMMANDS = USER_COMMANDS + [
+    BotCommand("admin", "Show all admin tools"),
+    BotCommand("add", "Create a series and start uploading"),
+    BotCommand("upload", "Choose a series to upload into"),
+    BotCommand("setnext", "Set the next episode number"),
+    BotCommand("done", "Finish upload mode"),
+    BotCommand("series", "List all series"),
+    BotCommand("info", "Episodes available and missing"),
+    BotCommand("stats", "Users, series, episodes, top series"),
+    BotCommand("broadcast", "Send a message to all users"),
+    BotCommand("rename", "Rename a series"),
+    BotCommand("delep", "Delete episode(s)"),
+    BotCommand("delseries", "Delete a series"),
+]
+
+USER_HELP = (
+    "🎧 How to use:\n"
+    "• Type a series name (or /search name)\n"
+    "• Pick the series, you'll see how many episodes are available\n"
+    "• Send an episode number like 350, or a range like 350-370\n"
+    f"• Up to {MAX_RANGE} episodes per request"
+)
+
+ADMIN_HELP = """🔧 Admin tools
+
+📤 Uploading
+/add Series Name - create a series and start uploading
+/upload - pick an existing series to upload into
+Then send the audio files named like "Ep - 01" (the number is read from the name; a file without a number gets the next number)
+/setnext 350 - change the next episode number
+/done - finish upload mode
+
+🗂 Manage
+/series - list all series with episode counts
+/info Series Name - episodes available and missing numbers
+/rename Old Name | New Name
+/delep Series Name | 5 - delete one episode
+/delep Series Name | 5-10 - delete a range
+/delseries Series Name - delete a series
+
+📊 Users
+/stats - users, series, episodes, most requested
+/broadcast Your message - send a message to all users"""
+
+
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    text = (
-        "🎧 How to use:\n"
-        "• Type a series name (or /search name)\n"
-        "• Pick the series, you'll see how many episodes are available\n"
-        "• Send an episode number like 350, or a range like 350-370"
-    )
+    text = USER_HELP
     if is_admin(update):
-        text += (
-            "\n\n🔧 Admin:\n"
-            "• /add Series Name - create the series and start uploading\n"
-            "• /upload - choose an existing series to upload into\n"
-            "• Then send audio files named like \"Ep - 01\" (number is read from the name;\n"
-            "  files without a number get the next number automatically)\n"
-            "• /setnext 350 - set the next episode number\n"
-            "• /done - stop upload mode\n"
-            "• /series - list all series\n"
-            "• /rename Old Name | New Name\n"
-            "• /delep Series Name | 5\n"
-            "• /delseries Series Name"
-        )
+        text += "\n\n" + ADMIN_HELP
     await update.message.reply_text(text)
+
+
+async def admin_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if is_admin(update):
+        await update.message.reply_text(ADMIN_HELP)
+
+
+async def track_user(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Remember every private-chat user once (used for /stats and /broadcast)."""
+    u = update.effective_user
+    chat = update.effective_chat
+    if not u or u.is_bot or not chat or chat.type != "private":
+        return
+    seen = ctx.application.bot_data.setdefault("seen", set())
+    if u.id in seen:
+        return
+    seen.add(u.id)
+    c = db()
+    c.execute(
+        "INSERT INTO users(user_id, name, username) VALUES(?,?,?) "
+        "ON CONFLICT(user_id) DO UPDATE SET name=excluded.name, username=excluded.username, active=1",
+        (u.id, u.full_name, u.username),
+    )
+    c.commit()
+    c.close()
 
 
 async def search_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -518,22 +599,170 @@ async def delete_series(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("🗑 Series deleted.")
 
 
+DEL_RE = re.compile(r"^\s*(.+?)\s*\|\s*(\d+)(?:\s*-\s*(\d+))?\s*$")
+
+
 async def delete_episode(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not is_admin(update):
         return
-    match = PIPE_RE.match(" ".join(ctx.args))
+    match = DEL_RE.match(" ".join(ctx.args))
     if not match:
-        await update.message.reply_text("Usage: /delep Series Name | 5")
+        await update.message.reply_text("Usage: /delep Series Name | 5   or   /delep Series Name | 5-10")
         return
-    name, number = match.group(1).strip(), int(match.group(2))
+    name = match.group(1).strip()
+    a = int(match.group(2))
+    b = int(match.group(3) or a)
+    if a > b:
+        a, b = b, a
     c = db()
     cur = c.execute(
-        "DELETE FROM episodes WHERE number=? AND series_id=(SELECT id FROM series WHERE name=?)",
-        (number, name),
+        "DELETE FROM episodes WHERE number BETWEEN ? AND ? "
+        "AND series_id=(SELECT id FROM series WHERE name=?)",
+        (a, b, name),
     )
     c.commit()
     c.close()
-    await update.message.reply_text("🗑 Episode deleted." if cur.rowcount else "Episode not found.")
+    await update.message.reply_text(
+        f"🗑 Deleted {cur.rowcount} episode(s)." if cur.rowcount else "No matching episodes found."
+    )
+
+
+def compact_ranges(nums):
+    """[1,2,3,5,7,8] -> '1-3, 5, 7-8'"""
+    out, start, prev = [], None, None
+    for n in nums:
+        if start is None:
+            start = prev = n
+        elif n == prev + 1:
+            prev = n
+        else:
+            out.append((start, prev))
+            start = prev = n
+    if start is not None:
+        out.append((start, prev))
+    return ", ".join(str(a) if a == b else f"{a}-{b}" for a, b in out)
+
+
+async def info_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    name = " ".join(ctx.args).strip()
+    if not name:
+        await update.message.reply_text("Usage: /info Series Name")
+        return
+    c = db()
+    s = c.execute("SELECT id, name, hits FROM series WHERE name=?", (name,)).fetchone()
+    if not s:
+        like = c.execute(
+            "SELECT id, name, hits FROM series WHERE name LIKE ? ORDER BY name LIMIT 2", (f"%{name}%",)
+        ).fetchall()
+        if len(like) == 1:
+            s = like[0]
+        elif len(like) > 1:
+            c.close()
+            await update.message.reply_text("More than one series matches. Type the full name (see /series).")
+            return
+    if not s:
+        c.close()
+        await update.message.reply_text("Series not found.")
+        return
+    nums = [r["number"] for r in c.execute(
+        "SELECT number FROM episodes WHERE series_id=? ORDER BY number", (s["id"],)
+    ).fetchall()]
+    c.close()
+
+    if not nums:
+        await update.message.reply_text(f"🎧 {s['name']}\nNo episodes yet.")
+        return
+    have = set(nums)
+    missing = [n for n in range(nums[0], nums[-1] + 1) if n not in have]
+    text = (
+        f"🎧 {s['name']}\n"
+        f"Total: {len(nums)} episodes (No. {nums[0]} to {nums[-1]})\n"
+        f"Requests so far: {s['hits']}\n\n"
+        f"✅ Available: {compact_ranges(nums)}\n\n"
+        f"⚠️ Missing: {compact_ranges(missing) if missing else 'none'}"
+    )
+    for i in range(0, len(text), 4000):
+        await update.message.reply_text(text[i:i + 4000])
+
+
+async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    c = db()
+    u = c.execute("SELECT COUNT(*) AS n, COALESCE(SUM(active), 0) AS a FROM users").fetchone()
+    n_series = c.execute("SELECT COUNT(*) AS n FROM series").fetchone()["n"]
+    n_eps = c.execute("SELECT COUNT(*) AS n FROM episodes").fetchone()["n"]
+    top = c.execute(
+        "SELECT name, hits FROM series WHERE hits > 0 ORDER BY hits DESC LIMIT 5"
+    ).fetchall()
+    c.close()
+    text = (
+        "📊 Stats\n"
+        f"👥 Users: {u['n']} ({u['a']} active)\n"
+        f"📚 Series: {n_series}\n"
+        f"🎧 Episodes: {n_eps}"
+    )
+    if top:
+        text += "\n\n🔥 Most requested:\n" + "\n".join(
+            f"{i}. {r['name']} ({r['hits']})" for i, r in enumerate(top, 1)
+        )
+    await update.message.reply_text(text)
+
+
+async def broadcast_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update):
+        return
+    parts = (update.message.text or "").split(None, 1)
+    if len(parts) < 2 or not parts[1].strip():
+        await update.message.reply_text("Usage: /broadcast Your message")
+        return
+    text = parts[1].strip()
+    admin_chat = update.effective_chat.id
+
+    c = db()
+    ids = [r["user_id"] for r in c.execute("SELECT user_id FROM users WHERE active=1").fetchall()]
+    c.close()
+    if not ids:
+        await update.message.reply_text("No users yet.")
+        return
+    await update.message.reply_text(f"📣 Sending to {len(ids)} users...")
+
+    async def job():
+        ok, fail, blocked = 0, 0, []
+        for uid in ids:
+            try:
+                await with_retry(lambda uid=uid: ctx.bot.send_message(uid, text))
+                ok += 1
+            except Forbidden:
+                blocked.append(uid)
+                fail += 1
+            except Exception:
+                fail += 1
+            await asyncio.sleep(0.06)   # about 16 messages/second, under Telegram's limit
+        if blocked:
+            cc = db()
+            cc.executemany("UPDATE users SET active=0 WHERE user_id=?", [(b,) for b in blocked])
+            cc.commit()
+            cc.close()
+        await ctx.bot.send_message(
+            admin_chat, f"✅ Broadcast finished.\nDelivered: {ok}\nFailed or blocked: {fail}"
+        )
+
+    ctx.application.create_task(job(), update=update)
+
+
+async def post_init(app: Application):
+    try:
+        await app.bot.set_my_commands(USER_COMMANDS)
+    except Exception:
+        logging.warning("could not set the command menu")
+    for aid in ADMINS:
+        try:
+            await app.bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(aid))
+        except Exception:
+            logging.warning("could not set admin menu for %s (they must press /start first)", aid)
 
 
 def main():
@@ -544,7 +773,8 @@ def main():
         logging.warning("ADMIN_IDS is empty: nobody can upload episodes")
     init_db()
 
-    app = Application.builder().token(token).build()
+    app = Application.builder().token(token).post_init(post_init).build()
+    app.add_handler(TypeHandler(Update, track_user), group=-1)
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("search", search_cmd))
@@ -556,6 +786,10 @@ def main():
     app.add_handler(CommandHandler("rename", rename_series))
     app.add_handler(CommandHandler("delseries", delete_series))
     app.add_handler(CommandHandler("delep", delete_episode))
+    app.add_handler(CommandHandler("admin", admin_cmd))
+    app.add_handler(CommandHandler("info", info_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("broadcast", broadcast_cmd))
     app.add_handler(MessageHandler(filters.AUDIO | filters.VOICE | filters.Document.ALL, on_upload))
     app.add_handler(CallbackQueryHandler(on_button))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
